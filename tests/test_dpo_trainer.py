@@ -232,6 +232,94 @@ class TestDPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    def test_preflight_alignment_reports_misaligned_indices(self):
+        # Unit test of the preflight check itself: valid batches pass silently, misaligned chosen/rejected
+        # prompts are reported with their pair indices.
+        collator = DataCollatorForPreference(pad_token_id=0)
+        examples = [
+            {"prompt_ids": [1, 2, 3], "chosen_ids": [4, 5], "rejected_ids": [6]},
+            {"prompt_ids": [7, 8], "chosen_ids": [9], "rejected_ids": [10, 11]},
+            {"prompt_ids": [12, 13], "chosen_ids": [14], "rejected_ids": [15]},
+        ]
+        batch = collator(examples)
+        DPOTrainer._preflight_preference_alignment(batch)  # valid batch passes silently
+
+        # Corrupt the prompt of the rejected rows of pairs 0 and 2 (rejected rows are the second half)
+        batch["input_ids"][3, 0] = 99  # rejected row of pair 0
+        batch["input_ids"][5, 0] = 98  # rejected row of pair 2
+        with pytest.raises(ValueError, match=r"pair index/indices \[0, 2\]"):
+            DPOTrainer._preflight_preference_alignment(batch)
+
+    def test_preflight_alignment_valid_pairs_loss_unchanged(self):
+        # With well-formed preference pairs, the preflight check is read-only: the loss is identical to the
+        # raw `_compute_loss` value, and training still updates the weights.
+        model_id = "trl-internal-testing/tiny-LlamaForCausalLM-3.2"
+        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            per_device_train_batch_size=4,
+            max_steps=1,
+            report_to="none",
+        )
+        trainer = DPOTrainer(model=model_id, args=training_args, train_dataset=dataset)
+
+        batch = next(iter(trainer.get_train_dataloader()))
+        batch = trainer._prepare_inputs(batch)
+        loss_with_preflight = trainer.compute_loss(trainer.model, batch)
+        loss_without_preflight = trainer._compute_loss(trainer.model, batch, False)
+        torch.testing.assert_close(loss_with_preflight, loss_without_preflight)
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+        trainer.train()
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+    def test_preflight_alignment_blocks_optimizer_step(self):
+        # With misaligned preference pairs, the preflight check must raise before any optimizer step, report
+        # the misaligned pair index, and leave the weights untouched.
+        model_id = "trl-internal-testing/tiny-LlamaForCausalLM-3.2"
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+
+        class MisaligningCollator:
+            # Corrupts the prompt of the rejected row of pair index 1 in every batch.
+            def __init__(self, collator, vocab_size):
+                self.collator = collator
+                self.vocab_size = vocab_size
+
+            def __call__(self, features):
+                batch = self.collator(features)
+                half = batch["input_ids"].size(0) // 2
+                row = half + 1  # rejected row of pair index 1
+                batch["input_ids"][row, 0] = (batch["input_ids"][row, 0] + 1) % self.vocab_size
+                return batch
+
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=4,
+            max_steps=1,
+            report_to="none",
+        )
+        trainer = DPOTrainer(
+            model=model_id,
+            args=training_args,
+            train_dataset=dataset,
+            data_collator=MisaligningCollator(
+                DataCollatorForPreference(pad_token_id=pad_token_id), tokenizer.vocab_size
+            ),
+        )
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+        with pytest.raises(ValueError, match=r"pair index/indices \[1\]"):
+            trainer.train()
+        # The preflight failure happens before the forward/backward/optimizer step: weights are untouched.
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            assert torch.equal(param, new_param), f"Parameter {n} has changed."
+
     @pytest.mark.parametrize("precompute_ref_log_probs", [False, True])
     @pytest.mark.parametrize(
         "eval_dataset_type",

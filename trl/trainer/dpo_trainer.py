@@ -1764,7 +1764,49 @@ class DPOTrainer(_BaseTrainer):
             eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix
         )
 
+    @staticmethod
+    def _preflight_preference_alignment(inputs: dict[str, Any]) -> None:
+        """
+        DPO preference alignment preflight check.
+
+        Verifies that, for every pair in the batch, the chosen and rejected rows are completions of the same
+        prompt. The batch layout is `[chosen, rejected]` (first half / second half of the rows), and prompt
+        tokens are the positions where `attention_mask == 1` and `completion_mask == 0`.
+
+        If any pair is misaligned, a [`ValueError`] listing the misaligned pair indices is raised before any
+        forward pass runs, so a corrupted batch can never trigger an optimizer step. For well-formed batches
+        this check is read-only and does not change the loss.
+        """
+        if not all(key in inputs for key in ("input_ids", "attention_mask", "completion_mask")):
+            return  # nothing to check (e.g. a custom collator producing a different format)
+        input_ids = inputs["input_ids"]
+        if input_ids.dim() != 2:
+            return  # unexpected layout (e.g. flattened padding to be re-supported): skip rather than misfire
+        batch_size = input_ids.size(0)
+        if batch_size % 2 != 0:
+            raise ValueError(
+                "DPO preference alignment preflight failed: the batch has an odd number of rows "
+                f"({batch_size}), so chosen/rejected pairs cannot be formed. Expected the first half of the "
+                "batch to be the chosen rows and the second half the rejected rows."
+            )
+        half = batch_size // 2
+        prompt_mask = inputs["attention_mask"].bool() & ~inputs["completion_mask"].bool()
+        prompt_ids = [row[mask] for row, mask in zip(input_ids, prompt_mask)]
+        misaligned = [idx for idx in range(half) if not torch.equal(prompt_ids[idx], prompt_ids[idx + half])]
+        to_report = misaligned[:10]  # cap the report so the error message stays readable
+        if misaligned:
+            raise ValueError(
+                "DPO preference alignment preflight failed: chosen/rejected pairs do not share the same prompt "
+                f"at pair index/indices {to_report}{'...' if len(misaligned) > len(to_report) else ''} "
+                f"(chosen rows {to_report} vs rejected rows {[idx + half for idx in to_report]}). "
+                "Each chosen response and its rejected counterpart must be completions of the same prompt. "
+                "No optimizer step was performed."
+            )
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # DPO preference alignment preflight: reject misaligned chosen/rejected pairs before any forward pass,
+        # so a corrupted batch can never reach an optimizer step. Read-only: valid batches are untouched.
+        self._preflight_preference_alignment(inputs)
         try:
             if self.use_liger_kernel:
                 # The chunked projection reads `lm_head.weight` directly, bypassing the module, so the loss has to
