@@ -90,6 +90,13 @@ class SFTConfig(_BaseConfig):
             If set, the sequences will be padded to a multiple of this value.
         eval_packing (`bool`, *optional*):
             Whether to pack the eval dataset. If `None`, uses the same value as `packing`.
+        dataset_filter_stats (`bool`, *optional*, defaults to `False`):
+            Whether to filter out invalid examples during dataset preparation and record per-category statistics.
+            When `True`, examples with empty text, sequences longer than `max_length` (dropped instead of truncated),
+            and examples whose chat template application fails are removed, and the counts per category are exposed
+            via [`~SFTTrainer.dataset_filter_stats`]. Only example counts are recorded, never example content. When
+            `False` (default), no filtering is applied and the sample order and behavior are unchanged. Only
+            supported for map-style datasets (not `IterableDataset`).
 
         > Parameters that control the training
 
@@ -253,6 +260,17 @@ class SFTConfig(_BaseConfig):
     eval_packing: bool | None = field(
         default=None,
         metadata={"help": "Whether to pack the eval dataset. If `None`, uses the same value as `packing`."},
+    )
+    dataset_filter_stats: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to filter out invalid examples during dataset preparation and record per-category "
+            "statistics. When `True`, examples with empty text, sequences longer than `max_length` (dropped instead "
+            "of truncated), and examples whose chat template application fails are removed, and the counts per "
+            "category are exposed via `SFTTrainer.dataset_filter_stats`. Only example counts are recorded, never "
+            "example content. When `False` (default), no filtering is applied and the sample order and behavior are "
+            "unchanged. Only supported for map-style datasets (not `IterableDataset`)."
+        },
     )
 
     # Parameters that control the training

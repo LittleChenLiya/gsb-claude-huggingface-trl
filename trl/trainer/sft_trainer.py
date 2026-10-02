@@ -233,6 +233,40 @@ def _chunked_cross_entropy_loss(
     return loss, correct, entropy_sum, n_valid_tensor
 
 
+# Column used to carry the per-example filtering reason through the dataset preparation pipeline when
+# `dataset_filter_stats=True`. It is dropped before the prepared dataset is returned.
+_FILTER_REASON_COLUMN = "_filter_reason"
+
+
+def _content_is_empty(content: Any) -> bool:
+    """Check whether a single piece of content carries no text (missing or empty/whitespace-only string)."""
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    # Non-string content (e.g. multimodal parts) counts as non-empty.
+    return False
+
+
+def _is_empty_example(example: dict[str, Any], dataset_text_field: str) -> bool:
+    """
+    Check whether an example carries no textual content worth training on.
+
+    Covers the three dataset shapes seen during SFT dataset preparation: conversational (`"messages"`),
+    prompt-completion (`"prompt"`/`"completion"`, either plain text or conversational), and standard text
+    (`dataset_text_field`).
+    """
+    if "messages" in example:  # conversational language modeling
+        messages = example["messages"]
+        return all(_content_is_empty(message.get("content")) for message in messages if isinstance(message, dict))
+    if "prompt" in example and "completion" in example:  # prompt-completion
+        if is_conversational(example):
+            messages = example["prompt"] + example["completion"]
+            return all(_content_is_empty(message.get("content")) for message in messages if isinstance(message, dict))
+        return _content_is_empty(example["prompt"]) and _content_is_empty(example["completion"])
+    return _content_is_empty(example.get(dataset_text_field))  # standard text
+
+
 def _patch_chunked_ce_lm_head(model: torch.nn.Module, chunk_size: int, is_vlm: bool = False) -> None:
     """
     Patch `model.forward` to compute the LM loss via [`_chunked_cross_entropy_loss`].
@@ -1300,6 +1334,9 @@ class SFTTrainer(_BaseTrainer):
         )
         # Kept on the instance so that `evaluate` can preprocess freshly-passed eval datasets the same way.
         self._formatting_func = formatting_func
+        # Per-dataset filtering statistics, populated by `_prepare_dataset` when `args.dataset_filter_stats=True`.
+        # Only example counts are recorded — never example content. Keyed by dataset name ("train", "eval", ...).
+        self._dataset_filter_stats: dict[str, dict[str, int]] = {}
         eval_datasets = (
             eval_dataset if isinstance(eval_dataset, dict) else {"eval": eval_dataset} if eval_dataset else {}
         )
@@ -1461,6 +1498,18 @@ class SFTTrainer(_BaseTrainer):
         # Add tags to the model
         self.model.add_model_tags(self._tag_names)
 
+    @property
+    def dataset_filter_stats(self) -> dict[str, dict[str, int]]:
+        """
+        Filtering statistics collected during dataset preparation when `dataset_filter_stats=True`.
+
+        Returns a dict keyed by dataset name (`"train"`, `"eval"`, ...), where each value holds example counts:
+        `"total"` (examples seen), `"kept"` (examples kept), and the drop reasons `"empty_text"`, `"overlong"` and
+        `"template_error"`. Only counts are recorded — never example content. Empty when
+        `dataset_filter_stats=False`.
+        """
+        return self._dataset_filter_stats
+
     def _prepare_dataset(
         self,
         dataset: Dataset | IterableDataset,
@@ -1482,6 +1531,25 @@ class SFTTrainer(_BaseTrainer):
         # If the dataset is already preprocessed (tokenized), skip the processing steps.
         column_names = get_dataset_column_names(dataset)
         is_processed = "input_ids" in column_names
+
+        # Set up filtering statistics collection. When enabled, invalid examples (empty text, overlong sequences,
+        # chat template failures) are dropped and counted per category; only counts are recorded, never example
+        # content. When disabled, no filtering step runs and the sample order and behavior are unchanged.
+        filter_stats = None
+        if args.dataset_filter_stats:
+            if isinstance(dataset, Dataset):
+                filter_stats = {
+                    "total": len(dataset),
+                    "kept": len(dataset),
+                    "empty_text": 0,
+                    "overlong": 0,
+                    "template_error": 0,
+                }
+            else:
+                logger.warning(
+                    f"`dataset_filter_stats=True` is only supported for map-style datasets; filtering statistics "
+                    f"are not collected for the {dataset_name} dataset."
+                )
 
         # Build the kwargs for the `map` function
         map_kwargs = {}
@@ -1519,6 +1587,23 @@ class SFTTrainer(_BaseTrainer):
                         **map_kwargs,
                     )
 
+                # Mark examples with no textual content (empty or whitespace-only) so they can be dropped and
+                # counted after tokenization. This runs before the EOS token is appended, which would otherwise
+                # make every empty text non-empty.
+                if filter_stats is not None:
+                    if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
+                        map_kwargs["desc"] = f"Marking empty examples in {dataset_name} dataset"
+
+                    def mark_empty(example, dataset_text_field):
+                        reason = "empty_text" if _is_empty_example(example, dataset_text_field) else None
+                        return {_FILTER_REASON_COLUMN: reason}
+
+                    dataset = dataset.map(
+                        mark_empty,
+                        fn_kwargs={"dataset_text_field": args.dataset_text_field},
+                        **map_kwargs,
+                    )
+
                 # Add EOS token if needed: non-conversational only
                 first_example = next(iter(dataset))
                 if not is_conversational(first_example):
@@ -1543,70 +1628,84 @@ class SFTTrainer(_BaseTrainer):
                 if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                     map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
 
-                def tokenize_fn(example, processing_class, dataset_text_field, assistant_only_loss, chat_template):
-                    tools = example.get("tools")
-                    tools = json.loads(tools) if isinstance(tools, str) else tools
-                    apply_chat_template_kwargs = {
-                        "chat_template": chat_template,
-                        "tools": tools,
-                        **example.get("chat_template_kwargs", {}),
-                    }
-                    if "prompt" in example:  # prompt-completion case
-                        output = {}
-                        if is_conversational(example):
-                            prompt_ids = _tokenize(
-                                processing_class,
-                                example["prompt"],
-                                add_generation_prompt=True,
-                                **apply_chat_template_kwargs,
-                            )["input_ids"]
-                            prompt_completion_processed = _tokenize(
-                                processing_class,
-                                example["prompt"] + example["completion"],
-                                return_assistant_tokens_mask=assistant_only_loss,
-                                **apply_chat_template_kwargs,
-                            )
-                            prompt_completion_ids = prompt_completion_processed["input_ids"]
-                            if "assistant_masks" in prompt_completion_processed:
-                                output["assistant_masks"] = prompt_completion_processed["assistant_masks"]
-                        else:
-                            prompt_ids = _tokenize(processing_class, example["prompt"], chat_template=chat_template)[
-                                "input_ids"
-                            ]
-                            prompt_completion_ids = _tokenize(
-                                processing_class,
-                                example["prompt"] + example["completion"],
-                                chat_template=chat_template,
-                            )["input_ids"]
-
-                        # Check if the tokenized prompt starts with the tokenized prompt+completion
-                        if not prompt_completion_ids[: len(prompt_ids)] == prompt_ids:
-                            logger.warning(
-                                "Mismatch between tokenized prompt and the start of tokenized prompt+completion. "
-                                "This may be due to unexpected tokenizer behavior, whitespace issues, or special "
-                                "token handling. Verify that the tokenizer is processing text consistently."
-                            )
-
-                        # Create completion mask
-                        completion_mask = [0] * len(prompt_ids) + [1] * (len(prompt_completion_ids) - len(prompt_ids))
-                        output["input_ids"] = prompt_completion_ids
-                        output["completion_mask"] = completion_mask
-
-                    else:  # language modeling case
-                        if is_conversational(example):
-                            processed = _tokenize(
-                                processing_class,
-                                example["messages"],
-                                return_assistant_tokens_mask=assistant_only_loss,
-                                **apply_chat_template_kwargs,
-                            )
-                            output = {k: processed[k] for k in ("input_ids", "assistant_masks") if k in processed}
-                        else:
-                            output = {
-                                "input_ids": _tokenize(
-                                    processing_class, example[dataset_text_field], chat_template=chat_template
+                def tokenize_fn(
+                    example, processing_class, dataset_text_field, assistant_only_loss, chat_template, filter_stats
+                ):
+                    try:
+                        tools = example.get("tools")
+                        tools = json.loads(tools) if isinstance(tools, str) else tools
+                        apply_chat_template_kwargs = {
+                            "chat_template": chat_template,
+                            "tools": tools,
+                            **example.get("chat_template_kwargs", {}),
+                        }
+                        if "prompt" in example:  # prompt-completion case
+                            output = {}
+                            if is_conversational(example):
+                                prompt_ids = _tokenize(
+                                    processing_class,
+                                    example["prompt"],
+                                    add_generation_prompt=True,
+                                    **apply_chat_template_kwargs,
                                 )["input_ids"]
-                            }
+                                prompt_completion_processed = _tokenize(
+                                    processing_class,
+                                    example["prompt"] + example["completion"],
+                                    return_assistant_tokens_mask=assistant_only_loss,
+                                    **apply_chat_template_kwargs,
+                                )
+                                prompt_completion_ids = prompt_completion_processed["input_ids"]
+                                if "assistant_masks" in prompt_completion_processed:
+                                    output["assistant_masks"] = prompt_completion_processed["assistant_masks"]
+                            else:
+                                prompt_ids = _tokenize(
+                                    processing_class, example["prompt"], chat_template=chat_template
+                                )["input_ids"]
+                                prompt_completion_ids = _tokenize(
+                                    processing_class,
+                                    example["prompt"] + example["completion"],
+                                    chat_template=chat_template,
+                                )["input_ids"]
+
+                            # Check if the tokenized prompt starts with the tokenized prompt+completion
+                            if not prompt_completion_ids[: len(prompt_ids)] == prompt_ids:
+                                logger.warning(
+                                    "Mismatch between tokenized prompt and the start of tokenized prompt+completion. "
+                                    "This may be due to unexpected tokenizer behavior, whitespace issues, or special "
+                                    "token handling. Verify that the tokenizer is processing text consistently."
+                                )
+
+                            # Create completion mask
+                            completion_mask = [0] * len(prompt_ids) + [1] * (
+                                len(prompt_completion_ids) - len(prompt_ids)
+                            )
+                            output["input_ids"] = prompt_completion_ids
+                            output["completion_mask"] = completion_mask
+
+                        else:  # language modeling case
+                            if is_conversational(example):
+                                processed = _tokenize(
+                                    processing_class,
+                                    example["messages"],
+                                    return_assistant_tokens_mask=assistant_only_loss,
+                                    **apply_chat_template_kwargs,
+                                )
+                                output = {k: processed[k] for k in ("input_ids", "assistant_masks") if k in processed}
+                            else:
+                                output = {
+                                    "input_ids": _tokenize(
+                                        processing_class, example[dataset_text_field], chat_template=chat_template
+                                    )["input_ids"]
+                                }
+                    except Exception:
+                        if not filter_stats:
+                            raise
+                        # With filtering statistics enabled, examples whose chat template application or
+                        # tokenization fails are dropped and counted instead of aborting the whole preparation.
+                        # Only the reason is recorded, never the example content. An example already marked (e.g.
+                        # as empty) keeps its original reason.
+                        reason = example.get(_FILTER_REASON_COLUMN) or "template_error"
+                        return {"input_ids": [], _FILTER_REASON_COLUMN: reason}
 
                     if "assistant_masks" in output and 1 not in output["assistant_masks"]:
                         raise RuntimeError(
@@ -1624,9 +1723,21 @@ class SFTTrainer(_BaseTrainer):
                         "dataset_text_field": args.dataset_text_field,
                         "assistant_only_loss": args.assistant_only_loss,
                         "chat_template": self.chat_template,
+                        "filter_stats": filter_stats is not None,
                     },
                     **map_kwargs,
                 )
+
+                # Drop the examples marked during preparation (empty text, template/tokenization failures) and
+                # record the per-category counts. `Dataset.filter` preserves the order of the kept examples.
+                if filter_stats is not None and _FILTER_REASON_COLUMN in get_dataset_column_names(dataset):
+                    reasons = dataset[_FILTER_REASON_COLUMN]
+                    filter_stats["empty_text"] += sum(reason == "empty_text" for reason in reasons)
+                    filter_stats["template_error"] += sum(reason == "template_error" for reason in reasons)
+                    if isinstance(dataset, Dataset):  # `IterableDataset.filter` does not support `desc`
+                        map_kwargs["desc"] = f"Dropping invalid examples from {dataset_name} dataset"
+                    dataset = dataset.filter(lambda example: example[_FILTER_REASON_COLUMN] is None, **map_kwargs)
+                    dataset = dataset.remove_columns(_FILTER_REASON_COLUMN)
 
             # Build a "labels" column, setting tokens that shouldn't contribute to the loss to -100 based on the
             # available masks: "assistant_masks" always applies, "completion_mask" only when completion_only_loss
@@ -1672,6 +1783,18 @@ class SFTTrainer(_BaseTrainer):
                 if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
                     map_kwargs["desc"] = f"Truncating {dataset_name} dataset"
 
+                # With filtering statistics enabled, examples longer than `max_length` are dropped and counted
+                # instead of truncated. `Dataset.filter` preserves the order of the kept examples.
+                if filter_stats is not None:
+                    filter_stats["overlong"] += sum(
+                        len(input_ids) > args.max_length for input_ids in dataset["input_ids"]
+                    )
+                    if isinstance(dataset, Dataset):  # `IterableDataset.filter` does not support `desc`
+                        map_kwargs["desc"] = f"Dropping overlong examples from {dataset_name} dataset"
+                    dataset = dataset.filter(
+                        lambda example: len(example["input_ids"]) <= args.max_length, **map_kwargs
+                    )
+
                 def truncate(example, sl):
                     return {"input_ids": example["input_ids"][sl], "labels": example["labels"][sl]}
 
@@ -1707,6 +1830,16 @@ class SFTTrainer(_BaseTrainer):
                 collator_expected_keys = {"input_ids", "seq_lengths", "labels"}
                 column_names = get_dataset_column_names(dataset)
                 dataset = dataset.select_columns(collator_expected_keys.intersection(column_names))
+
+        if filter_stats is not None:
+            filter_stats["kept"] = len(dataset)
+            self._dataset_filter_stats[dataset_name] = filter_stats
+            logger.info(
+                f"Dataset filtering statistics for the {dataset_name} dataset: "
+                f"total={filter_stats['total']}, kept={filter_stats['kept']}, "
+                f"empty_text={filter_stats['empty_text']}, overlong={filter_stats['overlong']}, "
+                f"template_error={filter_stats['template_error']}"
+            )
 
         if args.shuffle_dataset:
             dataset = dataset.shuffle(seed=args.seed)
