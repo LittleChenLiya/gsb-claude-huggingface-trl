@@ -754,6 +754,46 @@ class RewardTrainer(_BaseTrainer):
             eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix
         )
 
+    def _compute_batch_diagnostics(self, rewards: torch.Tensor) -> dict[str, Any]:
+        """
+        Compute read-only batch diagnostics for reward training.
+
+        Lists the advantage value range and invalid sample indices. This method is read-only: it does not
+        modify the batch, the model, or any random number generator state, so it does not affect random
+        sampling.
+
+        Args:
+            rewards: Tensor of rewards with shape `(batch_size,)`. The first half corresponds to the chosen
+                samples and the second half to the rejected samples.
+
+        Returns:
+            Dictionary containing:
+            - `advantage_min`: Minimum advantage value (ignoring non-finite values).
+            - `advantage_max`: Maximum advantage value (ignoring non-finite values).
+            - `invalid_indices`: Indices of samples with non-finite advantage values.
+        """
+        rewards_chosen, rewards_rejected = torch.chunk(rewards, chunks=2)
+        advantages = rewards_chosen - rewards_rejected
+
+        # Find non-finite advantages (NaN or Inf)
+        non_finite_mask = ~torch.isfinite(advantages)
+        invalid_indices = torch.nonzero(non_finite_mask, as_tuple=False).squeeze(-1).tolist()
+
+        # Compute range over finite advantages only
+        finite_advantages = advantages[torch.isfinite(advantages)]
+        if finite_advantages.numel() > 0:
+            advantage_min = finite_advantages.min().item()
+            advantage_max = finite_advantages.max().item()
+        else:
+            advantage_min = float("nan")
+            advantage_max = float("nan")
+
+        return {
+            "advantage_min": advantage_min,
+            "advantage_max": advantage_max,
+            "invalid_indices": invalid_indices,
+        }
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         mode = "train" if self.model.training else "eval"
 
@@ -772,6 +812,20 @@ class RewardTrainer(_BaseTrainer):
 
         if self.args.center_rewards_coefficient is not None:
             loss += self.args.center_rewards_coefficient * torch.mean((rewards_chosen + rewards_rejected) ** 2)
+
+        # Run read-only batch diagnostics before the optimizer update. This does not affect random sampling.
+        if mode == "train":
+            rewards = outputs.logits.squeeze(-1)
+            diagnostics = self._compute_batch_diagnostics(rewards)
+            self._last_batch_diagnostics = diagnostics
+            self._has_non_finite = len(diagnostics["invalid_indices"]) > 0
+
+            if self._has_non_finite:
+                logger.warning(
+                    f"Non-finite advantage values detected at sample indices {diagnostics['invalid_indices']}. "
+                    f"Advantage range: [{diagnostics['advantage_min']:.4f}, {diagnostics['advantage_max']:.4f}]. "
+                    "Skipping optimizer step to prevent non-finite values from corrupting model weights."
+                )
 
         if mode == "train":
             num_tokens_in_batch = self.accelerator.gather_for_metrics(inputs["attention_mask"].sum()).sum().item()
@@ -795,10 +849,46 @@ class RewardTrainer(_BaseTrainer):
 
         return (loss, outputs) if return_outputs else loss
 
-    # Override training step to add activation offloading context.
+    # Override training step to add activation offloading context and to guard against non-finite values.
     def training_step(self, *args, **kwargs):
+        # Reset the non-finite flag at the start of each optimizer step (when global_step changes).
+        # This accumulates the flag across gradient accumulation micro-batches within an optimizer step.
+        current_step = self.state.global_step
+        if getattr(self, "_last_non_finite_step", -1) != current_step:
+            self._has_non_finite = False
+            self._last_non_finite_step = current_step
+
         with self.maybe_activation_offload_context:
-            return super().training_step(*args, **kwargs)
+            loss = super().training_step(*args, **kwargs)
+
+        # If there are non-finite advantage values, zero the gradients to prevent the optimizer from
+        # changing the weights. The optimizer step itself is also skipped via the wrapped optimizer step.
+        if getattr(self, "_has_non_finite", False):
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+
+        return loss
+
+    def create_optimizer_and_scheduler(self, num_training_steps: int) -> None:
+        super().create_optimizer_and_scheduler(num_training_steps)
+        # Wrap the optimizer step to skip it when there are non-finite advantage values. This prevents
+        # non-finite values from entering the optimizer and corrupting the model weights.
+        if not getattr(self, "_optimizer_step_wrapped", False):
+            original_step = self.optimizer.step
+
+            def checked_step(closure=None):
+                if getattr(self, "_has_non_finite", False):
+                    # Skip the optimizer step to prevent non-finite values from corrupting weights
+                    self._has_non_finite = False
+                    return
+                result = original_step(closure)
+                # Reset the flag after the optimizer step so the next optimizer step starts fresh
+                self._has_non_finite = False
+                return result
+
+            self.optimizer.step = checked_step
+            self._optimizer_step_wrapped = True
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"

@@ -17,8 +17,14 @@ import pathlib
 
 import pytest
 import torch
-from datasets import DatasetDict, IterableDatasetDict, load_dataset
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, BitsAndBytesConfig
+import torch.nn as nn
+from datasets import Dataset, DatasetDict, IterableDatasetDict, load_dataset
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    PretrainedConfig,
+)
 from transformers.utils import is_peft_available
 
 from trl import RewardConfig, RewardTrainer
@@ -1049,3 +1055,194 @@ class TestRewardTrainer(TrlTestCase):
         eos_token_id = trainer.processing_class.eos_token_id
         assert eos_token_id == 151644  # <|im_start|>
         assert trainer.model.config.eos_token_id == eos_token_id
+
+
+class _NaNTestConfig(PretrainedConfig):
+    model_type = "custom"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.num_labels = 1
+
+    def get_text_config(self, decoder=False):
+        return self
+
+
+class _NaNRewardModel(nn.Module):
+    """A simple reward model that can inject NaN values into rewards for testing."""
+
+    def __init__(self, nan_indices=None):
+        super().__init__()
+        self.config = _NaNTestConfig()
+        self.linear = nn.Linear(1, 1)
+        self.nan_indices = nan_indices or []
+        self.model_tags = None
+
+    def add_model_tags(self, tags):
+        self.model_tags = tags
+
+    def gradient_checkpointing_enable(self, **kwargs):
+        pass
+
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        batch_size = input_ids.shape[0]
+        x = input_ids.float().mean(dim=-1, keepdim=True)
+        logits = self.linear(x)
+        for idx in self.nan_indices:
+            if idx < batch_size:
+                logits[idx] = float("nan")
+        return type("Output", (), {"logits": logits})()
+
+
+def _create_diagnostic_dataset():
+    return Dataset.from_dict(
+        {
+            "chosen_ids": [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]],
+            "rejected_ids": [[13, 14, 15], [16, 17, 18], [19, 20, 21], [22, 23, 24]],
+        }
+    )
+
+
+def _get_diagnostic_tokenizer():
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+class TestRewardTrainingDiagnostics(TrlTestCase):
+    def test_diagnostics_normal_advantages(self):
+        """Test diagnostics with normal (finite) advantages."""
+        torch.manual_seed(42)
+        model = _NaNRewardModel()
+        dataset = _create_diagnostic_dataset()
+        tokenizer = _get_diagnostic_tokenizer()
+
+        training_args = RewardConfig(
+            output_dir=self.tmp_dir,
+            max_steps=1,
+            per_device_train_batch_size=2,
+            report_to="none",
+            use_cpu=True,
+            gradient_checkpointing=False,
+        )
+        trainer = RewardTrainer(model=model, args=training_args, train_dataset=dataset, processing_class=tokenizer)
+
+        initial_weights = {n: p.clone() for n, p in model.named_parameters()}
+
+        trainer.train()
+
+        diag = trainer._last_batch_diagnostics
+        assert len(diag["invalid_indices"]) == 0
+        assert diag["advantage_min"] <= diag["advantage_max"]
+
+        # Weights should change during normal training
+        weights_changed = any(not torch.equal(initial_weights[n], p) for n, p in model.named_parameters())
+        assert weights_changed
+
+    def test_diagnostics_nan_advantages_rejected(self):
+        """Test diagnostics with NaN advantages - weights should be unchanged."""
+        torch.manual_seed(42)
+        model = _NaNRewardModel(nan_indices=[1])
+        dataset = _create_diagnostic_dataset()
+        tokenizer = _get_diagnostic_tokenizer()
+
+        training_args = RewardConfig(
+            output_dir=self.tmp_dir,
+            max_steps=1,
+            per_device_train_batch_size=2,
+            report_to="none",
+            use_cpu=True,
+            gradient_checkpointing=False,
+        )
+        trainer = RewardTrainer(model=model, args=training_args, train_dataset=dataset, processing_class=tokenizer)
+
+        initial_weights = {n: p.clone() for n, p in model.named_parameters()}
+
+        trainer.train()
+
+        diag = trainer._last_batch_diagnostics
+        assert len(diag["invalid_indices"]) > 0
+        assert 1 in diag["invalid_indices"]
+
+        # Weights should NOT change when NaN is present
+        for n, p in model.named_parameters():
+            torch.testing.assert_close(initial_weights[n], p, msg=f"Parameter {n} has changed.")
+
+    def test_diagnostics_do_not_change_rng(self):
+        """Test that diagnostics do not change random sampling."""
+        # Run 1
+        torch.manual_seed(42)
+        model1 = _NaNRewardModel()
+        dataset1 = _create_diagnostic_dataset()
+        tokenizer1 = _get_diagnostic_tokenizer()
+        training_args1 = RewardConfig(
+            output_dir=self.tmp_dir,
+            max_steps=1,
+            per_device_train_batch_size=2,
+            report_to="none",
+            use_cpu=True,
+            gradient_checkpointing=False,
+        )
+        trainer1 = RewardTrainer(
+            model=model1, args=training_args1, train_dataset=dataset1, processing_class=tokenizer1
+        )
+        trainer1.train()
+        weights1 = {n: p.clone() for n, p in model1.named_parameters()}
+
+        # Run 2 (same seed)
+        torch.manual_seed(42)
+        model2 = _NaNRewardModel()
+        dataset2 = _create_diagnostic_dataset()
+        tokenizer2 = _get_diagnostic_tokenizer()
+        training_args2 = RewardConfig(
+            output_dir=self.tmp_dir,
+            max_steps=1,
+            per_device_train_batch_size=2,
+            report_to="none",
+            use_cpu=True,
+            gradient_checkpointing=False,
+        )
+        trainer2 = RewardTrainer(
+            model=model2, args=training_args2, train_dataset=dataset2, processing_class=tokenizer2
+        )
+        trainer2.train()
+        weights2 = {n: p.clone() for n, p in model2.named_parameters()}
+
+        # Weights should be identical (same seed, same sampling)
+        for n in weights1:
+            torch.testing.assert_close(weights1[n], weights2[n], msg=f"Parameter {n} differs between runs.")
+
+    def test_compute_batch_diagnostics_directly(self):
+        """Test _compute_batch_diagnostics directly with known values."""
+        torch.manual_seed(42)
+        model = _NaNRewardModel()
+        dataset = _create_diagnostic_dataset()
+        tokenizer = _get_diagnostic_tokenizer()
+
+        training_args = RewardConfig(
+            output_dir=self.tmp_dir,
+            max_steps=1,
+            report_to="none",
+            use_cpu=True,
+            gradient_checkpointing=False,
+        )
+        trainer = RewardTrainer(model=model, args=training_args, train_dataset=dataset, processing_class=tokenizer)
+
+        # Test with all finite values
+        rewards = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        diag = trainer._compute_batch_diagnostics(rewards)
+        assert diag["advantage_min"] == -2.0  # 1.0 - 3.0
+        assert diag["advantage_max"] == -2.0  # 2.0 - 4.0
+        assert diag["invalid_indices"] == []
+
+        # Test with NaN values
+        rewards_nan = torch.tensor([1.0, float("nan"), 3.0, 4.0])
+        diag_nan = trainer._compute_batch_diagnostics(rewards_nan)
+        assert diag_nan["advantage_min"] == -2.0  # 1.0 - 3.0 (finite only)
+        assert diag_nan["advantage_max"] == -2.0  # 2.0 - 4.0 is NaN, so only one finite
+        assert diag_nan["invalid_indices"] == [1]
+
+        # Test with Inf values
+        rewards_inf = torch.tensor([1.0, float("inf"), 3.0, 4.0])
+        diag_inf = trainer._compute_batch_diagnostics(rewards_inf)
+        assert diag_inf["invalid_indices"] == [1]
