@@ -1459,6 +1459,44 @@ def shutdown_event_loop_in_daemon(
 
 _CHUNKED_LOGPROB_CHUNK_SIZE = 32768
 
+# Token-chunk size for the pure PyTorch fallback of `ChunkedLogProbFunction`, used when Triton is unavailable
+_CHUNKED_LOGPROB_TORCH_TOKEN_CHUNK = 1024
+
+
+def _chunked_log_prob_torch(
+    hidden: torch.Tensor,  # [N, H]
+    weight: torch.Tensor,  # [V, H]
+    bias: torch.Tensor | None,  # [V]
+    targets: torch.Tensor,  # [N]
+    temperature: float,
+    chunk_size: int = _CHUNKED_LOGPROB_TORCH_TOKEN_CHUNK,
+    final_logit_softcapping: float | None = None,
+    logit_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pure PyTorch fallback for `ChunkedLogProbFunction`, for platforms where Triton is unavailable (e.g. Windows).
+
+    Computes the same per-token log-probabilities and entropy, chunking over tokens to bound the transient memory.
+    Unlike the Triton kernel, autograd retains every chunk's logits, so peak memory grows with the number of tokens;
+    prefer the kernel whenever Triton is available.
+    """
+    if hidden.shape[0] == 0:
+        # All-masked microbatch: return empty tensors that stay connected to the graph, so `backward()` still works
+        empty = hidden.sum(dim=-1) * 0.0
+        return empty, empty
+    log_probs, entropies = [], []
+    for start in range(0, hidden.shape[0], chunk_size):
+        logits = torch.nn.functional.linear(hidden[start : start + chunk_size], weight, bias).float()
+        logits = logits * logit_scale
+        if final_logit_softcapping is not None:
+            logits = final_logit_softcapping * torch.tanh(logits / final_logit_softcapping)
+        logits = logits / temperature
+        log_z = torch.logsumexp(logits, dim=-1)
+        target_logits = logits.gather(-1, targets[start : start + chunk_size].unsqueeze(-1)).squeeze(-1)
+        log_probs.append(target_logits - log_z)
+        entropies.append(log_z - (logits.softmax(-1) * logits).sum(-1))
+    return torch.cat(log_probs), torch.cat(entropies)
+
 
 @dataclass
 class FusedCausalLMOutput(ModelOutput):
@@ -1564,16 +1602,27 @@ def patch_fused_lm_head(model: PreTrainedModel, temperature: float = 1.0, cast_l
             if bias is not None:
                 bias = bias.full_tensor()
         with autocast_ctx, maybe_gather_lm_head_ctx(weight, bias):
-            per_token = _ChunkedLogProbFunction.apply(
-                hidden_states[mask],
-                weight,
-                bias,
-                labels[mask],
-                temperature,
-                _CHUNKED_LOGPROB_CHUNK_SIZE,
-                final_logit_softcapping,
-                logit_scale,
-            )
+            if _ChunkedLogProbFunction is not None:
+                per_token = _ChunkedLogProbFunction.apply(
+                    hidden_states[mask],
+                    weight,
+                    bias,
+                    labels[mask],
+                    temperature,
+                    _CHUNKED_LOGPROB_CHUNK_SIZE,
+                    final_logit_softcapping,
+                    logit_scale,
+                )
+            else:  # Triton is unavailable on this platform (e.g. Windows): use the pure PyTorch fallback
+                per_token = _chunked_log_prob_torch(
+                    hidden_states[mask],
+                    weight,
+                    bias,
+                    labels[mask],
+                    temperature,
+                    final_logit_softcapping=final_logit_softcapping,
+                    logit_scale=logit_scale,
+                )
         # `masked_scatter` keeps the output connected to the model even when no label is valid. This lets an
         # all-masked microbatch contribute a differentiable zero instead of failing in `backward()`.
         log_probs, entropy = (x.new_zeros(mask.shape).masked_scatter(mask, x) for x in per_token)

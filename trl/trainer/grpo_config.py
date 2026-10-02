@@ -223,6 +223,14 @@ class GRPOConfig(_BaseConfig):
               normalized at the batch level when forming advantages. This is the suggested approach from the paper
               [GDPO: Group reward-Decoupled Normalization Policy Optimization for Multi-reward RL
               Optimization](https://huggingface.co/papers/2601.05242).
+        missing_reward_policy (`str`, *optional*, defaults to `"skip"`):
+            Policy applied when every reward function returns `None` for a completion, making it unscorable.
+            Supported values are:
+
+            - `"skip"` (default): log a warning and exclude the unscorable completion from the reward baseline; its
+              advantage is set to `0.0` so it contributes no gradient. If a whole prompt group is unscorable, the
+              group's advantages are all `0.0` (never NaN).
+            - `"fail"`: raise a `ValueError` as soon as an unscorable completion is detected.
         scale_rewards (`str` or `bool`, *optional*, defaults to `"group"`):
             Specifies the scaling strategy for rewards. Supported values are:
 
@@ -781,6 +789,15 @@ class GRPOConfig(_BaseConfig):
             "GDPO: Group reward-Decoupled Normalization Policy Optimization for Multi-reward RL Optimization."
         },
     )
+    missing_reward_policy: str = field(
+        default="skip",
+        metadata={
+            "help": "Policy applied when every reward function returns `None` for a completion, making it "
+            "unscorable. `'skip'` (default): log a warning and exclude the unscorable completion from the reward "
+            "baseline; its advantage is set to `0.0` so it contributes no gradient. `'fail'`: raise a `ValueError` "
+            "as soon as an unscorable completion is detected."
+        },
+    )
     scale_rewards: str = field(
         default="group",
         metadata={
@@ -1063,6 +1080,12 @@ class GRPOConfig(_BaseConfig):
             )
 
         self.scale_rewards = {True: "group", False: "none"}.get(self.scale_rewards, self.scale_rewards)
+
+        if self.missing_reward_policy not in ("skip", "fail"):
+            raise ValueError(
+                f"Invalid value for missing_reward_policy: {self.missing_reward_policy}. Must be one of 'skip' or "
+                "'fail'."
+            )
 
         if self.log_completions_hub_repo is not None and not self.log_completions:
             raise ValueError(

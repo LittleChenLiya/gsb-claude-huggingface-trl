@@ -2667,6 +2667,126 @@ class TestGRPOTrainer(TrlTestCase):
         expected_warning = "All reward functions returned None for the following kwargs:"
         assert expected_warning in caplog.text
 
+    def test_missing_reward_policy_invalid_value(self):
+        """Test that an invalid missing_reward_policy is rejected at config creation."""
+        with pytest.raises(ValueError, match="Invalid value for missing_reward_policy"):
+            GRPOConfig(output_dir=self.tmp_dir, missing_reward_policy="bogus")
+
+    def test_missing_reward_policy_skip_partial(self):
+        """Test that with the default 'skip' policy, partially missing rewards are excluded from the baseline and the
+        per-group count of valid completions is logged."""
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        def partially_none_reward_func(completions, **kwargs):
+            """Reward function that returns None for the first completion of each call (one per group here)."""
+            return [None] + [float(i) for i in range(1, len(completions))]
+
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            per_device_train_batch_size=3,  # one group of num_generations=3 completions per step
+            num_generations=3,
+            max_completion_length=8,  # reduce the completion length to reduce memory usage
+            report_to="none",
+        )
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs=partially_none_reward_func,
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        previous_trainable_params = {
+            n: param.clone() for n, param in trainer.model.named_parameters() if param.requires_grad
+        }
+
+        trainer.train()
+
+        # Each group has num_generations=3 completions, one of which is unscorable (None) -> 2 valid per group
+        for log in trainer.state.log_history:
+            if "valid_completions_per_group/mean" in log:
+                assert log["valid_completions_per_group/mean"] == 2.0
+                assert log["valid_completions_per_group/min"] == 2.0
+        assert "valid_completions_per_group/mean" in trainer.state.log_history[-1]
+
+        # Training must have run without NaN gradients and the scorable completions must move the policy
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+        for n, param in trainer.model.named_parameters():
+            assert torch.isfinite(param).all(), f"Parameter {n} contains non-finite values."
+        changed = any(
+            not torch.equal(param, trainer.model.get_parameter(n)) for n, param in previous_trainable_params.items()
+        )
+        assert changed, "No parameter has changed."
+
+    def test_missing_reward_policy_skip_all_missing_no_nan(self, caplog):
+        """Test that with the default 'skip' policy, a fully missing group yields zero advantages and finite (zero)
+        gradients instead of NaNs."""
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        def always_none_reward_func(completions, **kwargs):
+            """Reward function that always returns None."""
+            return [None] * len(completions)
+
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,
+            per_device_train_batch_size=3,
+            num_generations=3,
+            max_completion_length=8,
+            report_to="none",
+        )
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs=always_none_reward_func,
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+        with caplog.at_level("WARNING", logger="trl.trainer.grpo_trainer"):
+            trainer.train()
+
+        assert "All reward functions returned None for the following kwargs:" in caplog.text
+
+        # Every group is fully missing -> 0 valid completions per group
+        assert trainer.state.log_history[-1]["valid_completions_per_group/mean"] == 0.0
+        assert trainer.state.log_history[-1]["valid_completions_per_group/min"] == 0.0
+
+        # All advantages are forced to 0, so the loss is 0 and no NaN gradient can corrupt the parameters
+        assert trainer.state.log_history[-1]["train_loss"] == pytest.approx(0.0)
+        for n, param in trainer.model.named_parameters():
+            assert torch.isfinite(param).all(), f"Parameter {n} contains non-finite values."
+            new_param = trainer.model.get_parameter(n)
+            assert torch.equal(previous_trainable_params[n], new_param), f"Parameter {n} has changed."
+
+    def test_missing_reward_policy_fail(self):
+        """Test that with missing_reward_policy='fail', an unscorable completion raises a ValueError."""
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        def always_none_reward_func(completions, **kwargs):
+            """Reward function that always returns None."""
+            return [None] * len(completions)
+
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,
+            per_device_train_batch_size=3,
+            num_generations=3,
+            max_completion_length=8,
+            report_to="none",
+            missing_reward_policy="fail",
+        )
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs=always_none_reward_func,
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        with pytest.raises(ValueError, match="All reward functions returned None"):
+            trainer.train()
+
     @pytest.mark.parametrize("loss_type", ["grpo", "bnpo", "dr_grpo", "dapo", "cispo"])
     def test_warning_raised_sequence_level_with_token_summed_loss(self, caplog, loss_type):
         """Test that a warning is raised when sequence-level importance sampling is combined with a loss type that

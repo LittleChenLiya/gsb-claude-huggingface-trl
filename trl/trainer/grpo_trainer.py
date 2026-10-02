@@ -779,6 +779,7 @@ class GRPOTrainer(_BaseTrainer):
         self.vllm_importance_sampling_clip_min = args.vllm_importance_sampling_clip_min
         self.loss_type = args.loss_type
         self.multi_objective_aggregation = args.multi_objective_aggregation
+        self.missing_reward_policy = args.missing_reward_policy
 
         # MoE load-balancing auxiliary loss. `output_router_logits` in the config means the model returns its router
         # logits; `router_aux_loss_coef` is the architecture's own coefficient, 0.0 when the config declares none.
@@ -1601,7 +1602,8 @@ class GRPOTrainer(_BaseTrainer):
             for idx, output_reward_func in async_results:
                 rewards_per_func[:, idx] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
-        # If all reward functions return None for a given row, issue a detailed warning
+        # If all reward functions return None for a given row, the completion is unscorable. Depending on
+        # `missing_reward_policy`, either raise ("fail") or warn and skip the row ("skip", default).
         if torch.isnan(rewards_per_func).all(dim=1).any():
             nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
             row_reward_kwargs = {
@@ -1611,9 +1613,17 @@ class GRPOTrainer(_BaseTrainer):
             }
             row_reward_kwargs["prompt"] = prompts[nan_row_idx]
             row_reward_kwargs["completion"] = completions[nan_row_idx]
+            message = f"All reward functions returned None for the following kwargs:\n{row_reward_kwargs}\n"
+            if self.missing_reward_policy == "fail":
+                raise ValueError(
+                    message + "missing_reward_policy='fail' is set, so training cannot continue with unscorable "
+                    "completions. Please ensure that at least one reward function returns a valid reward, or set "
+                    "missing_reward_policy='skip' to exclude unscorable completions instead."
+                )
             logger.warning(
-                f"All reward functions returned None for the following kwargs:\n{row_reward_kwargs}\n"
-                "Please ensure that at least one reward function returns a valid reward."
+                message + "Please ensure that at least one reward function returns a valid reward. "
+                "The unscorable completions are skipped: they are excluded from the reward baseline and their "
+                "advantage is set to 0.0."
             )
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
@@ -2737,6 +2747,11 @@ class GRPOTrainer(_BaseTrainer):
         self._metrics[mode]["reward"].append(torch.nanmean(rewards).item())
         self._metrics[mode]["reward_std"].append(nanstd(rewards).item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+        # Number of scorable completions (at least one reward function returned a value) per prompt group. Groups
+        # with fewer valid completions than num_generations indicate missing rewards.
+        valid_per_group = (~unscorable_mask).view(-1, num_generations).sum(dim=1).float()
+        self._metrics[mode]["valid_completions_per_group/mean"].append(valid_per_group.mean().item())
+        self._metrics[mode]["valid_completions_per_group/min"].append(valid_per_group.min().item())
 
         # Log prompt and completion texts
         self._logs["prompt"].extend(gather_object(prompts_text))
