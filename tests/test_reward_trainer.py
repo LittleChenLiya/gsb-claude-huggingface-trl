@@ -17,7 +17,7 @@ import pathlib
 
 import pytest
 import torch
-from datasets import DatasetDict, IterableDatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, IterableDatasetDict, load_dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, BitsAndBytesConfig
 from transformers.utils import is_peft_available
 
@@ -1049,3 +1049,128 @@ class TestRewardTrainer(TrlTestCase):
         eos_token_id = trainer.processing_class.eos_token_id
         assert eos_token_id == 151644  # <|im_start|>
         assert trainer.model.config.eos_token_id == eos_token_id
+
+
+class TestRewardBatchDiagnostics(TrlTestCase):
+    """Tests for the read-only pre-update batch diagnostics of `RewardTrainer`."""
+
+    model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
+
+    def _make_trainer(self, dataset, seed=0):
+        torch.manual_seed(seed)
+        training_args = RewardConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=len(dataset),
+            report_to="none",
+            seed=seed,
+            data_seed=seed,
+        )
+        trainer = RewardTrainer(model=self.model_id, args=training_args, train_dataset=dataset)
+        trainer.model.train()
+        return trainer
+
+    @staticmethod
+    def _make_dataset(nan_margin_index=None):
+        # Pre-tokenized preferences with varying lengths so that rewards differ across samples.
+        data = {
+            "chosen_ids": [[1, 2, 3, 4], [5, 6, 7], [1, 7, 2], [3, 4]],
+            "rejected_ids": [[8, 9], [1, 2, 3, 4], [9, 1], [5, 6, 7, 8]],
+            "margin": [0.0, 0.0, 0.0, 0.0],
+        }
+        if nan_margin_index is not None:
+            data["margin"][nan_margin_index] = float("nan")
+        return Dataset.from_dict(data)
+
+    def test_diagnostics_report_advantage_range_on_healthy_batch(self):
+        trainer = self._make_trainer(self._make_dataset())
+        batch = next(iter(trainer.get_train_dataloader()))
+
+        # Independent reference computation of the expected advantages.
+        with torch.no_grad():
+            logits = trainer.model(
+                input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False
+            ).logits.squeeze(-1)
+            chosen, rejected = torch.chunk(logits, 2)
+            expected_advantages = chosen - rejected
+
+        diagnostics = trainer._diagnose_advantages(expected_advantages.clone())
+
+        assert diagnostics["num_invalid"] == 0
+        assert diagnostics["invalid_indices"] == []
+        assert diagnostics["min_advantage"] == pytest.approx(expected_advantages.min().item())
+        assert diagnostics["max_advantage"] == pytest.approx(expected_advantages.max().item())
+        # The diagnostics are also exposed on the trainer for later inspection.
+        assert trainer._last_batch_diagnostics == diagnostics
+
+    def test_diagnostics_do_not_mutate_inputs_or_consume_rng(self):
+        trainer = self._make_trainer(self._make_dataset())
+        batch = next(iter(trainer.get_train_dataloader()))
+
+        with torch.no_grad():
+            logits = trainer.model(
+                input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False
+            ).logits.squeeze(-1)
+        chosen, rejected = torch.chunk(logits, 2)
+        advantages = (chosen - rejected).clone()
+        advantages_snapshot = advantages.clone()
+        logits_snapshot = logits.clone()
+
+        # Diagnostics must not consume the RNG: random draws made before and after it must match.
+        torch.manual_seed(123)
+        _ = torch.randn(8)
+        rng_state = torch.random.get_rng_state().clone()
+        trainer._diagnose_advantages(advantages)
+        assert torch.equal(torch.random.get_rng_state(), rng_state)
+        torch.manual_seed(123)
+        _ = torch.randn(8)
+        assert torch.equal(torch.random.get_rng_state(), rng_state)
+
+        # Diagnostics must not mutate the advantages tensor, the model outputs, or any model parameter.
+        assert torch.equal(advantages, advantages_snapshot)
+        assert torch.equal(logits, logits_snapshot)
+
+    def test_nan_advantage_is_rejected_and_weights_are_unchanged(self):
+        nan_index = 2
+        trainer = self._make_trainer(self._make_dataset(nan_margin_index=nan_index))
+        batch = next(iter(trainer.get_train_dataloader()))
+
+        # Map the collator position of the sample carrying the NaN margin.
+        expected_nan_position = int(torch.nonzero(torch.isnan(batch["margin"]), as_tuple=False).flatten().item())
+
+        weights_before = {n: p.detach().clone() for n, p in trainer.model.named_parameters() if p.requires_grad}
+
+        # The batch is rejected before backward(): non-finite values can never reach the optimizer.
+        with pytest.raises(ValueError, match="non-finite advantages"):
+            trainer.training_step(trainer.model, batch)
+
+        diagnostics = trainer._last_batch_diagnostics
+        assert diagnostics["num_invalid"] == 1
+        assert diagnostics["invalid_indices"] == [expected_nan_position]
+        assert diagnostics["min_advantage"] is not None  # range computed over the remaining finite samples
+        assert diagnostics["max_advantage"] is not None
+
+        # No parameter (nor gradient) may have changed.
+        for n, weight_before in weights_before.items():
+            weight_after = trainer.model.get_parameter(n)
+            assert torch.equal(weight_after, weight_before), f"Parameter {n} changed despite the rejected batch."
+            if weight_after.grad is not None:
+                assert torch.count_nonzero(weight_after.grad) == 0, f"Parameter {n} accumulated gradients."
+
+    def test_end_to_end_train_rejects_nonfinite_batch(self):
+        nan_index = 1
+        trainer = self._make_trainer(self._make_dataset(nan_margin_index=nan_index))
+        weights_before = {n: p.detach().clone() for n, p in trainer.model.named_parameters() if p.requires_grad}
+
+        with pytest.raises(ValueError, match="non-finite advantages"):
+            trainer.train()
+
+        for n, weight_before in weights_before.items():
+            assert torch.equal(trainer.model.get_parameter(n), weight_before), f"Parameter {n} changed."
+
+    def test_healthy_training_still_updates_weights(self):
+        trainer = self._make_trainer(self._make_dataset())
+        weights_before = {n: p.detach().clone() for n, p in trainer.model.named_parameters() if p.requires_grad}
+        trainer.train()
+        assert any(not torch.equal(trainer.model.get_parameter(n), weight) for n, weight in weights_before.items()), (
+            "Healthy batches should still update the weights."
+        )

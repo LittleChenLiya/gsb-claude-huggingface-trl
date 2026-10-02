@@ -609,6 +609,10 @@ class RewardTrainer(_BaseTrainer):
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
 
+        # Read-only diagnostics of the most recent training batch (advantage range and invalid sample indices).
+        # This is populated by `_diagnose_advantages`; it never feeds back into the optimization path.
+        self._last_batch_diagnostics = None
+
         # Tensor parallel ranks are given the same batch, so a token count gathered across all processes repeats
         # every token once per rank in the group. Context and sequence parallelism shard the batch before the loss is
         # computed, so they need no such correction. `parallelism_config` requires accelerate 1.12.0.
@@ -754,6 +758,70 @@ class RewardTrainer(_BaseTrainer):
             eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix
         )
 
+    def _diagnose_advantages(self, advantages: torch.Tensor) -> dict[str, Any]:
+        """Build a read-only diagnostic report for a batch of per-sample advantages.
+
+        The diagnostic is purely observational: it does not consume the random-number generator (all operations are
+        deterministic reductions), does not mutate ``advantages`` or any autograd state (it runs under
+        ``torch.no_grad`` and uses detached copies), and its result is never fed into the loss. Therefore it cannot
+        change which samples are drawn for subsequent batches.
+
+        Args:
+            advantages (`torch.Tensor`): One advantage per preference sample in the (local) batch.
+
+        Returns:
+            `dict[str, Any]`: A report with the keys:
+            - `"min_advantage"` / `"max_advantage"` (`float | None`): range of the finite advantages, `None` if every
+              sample is invalid.
+            - `"num_invalid"` (`int`): number of samples with non-finite (NaN/Inf) advantages.
+            - `"invalid_indices"` (`list[int]`): global indices of the invalid samples within the batch (indices refer
+              to the gathered batch across all processes).
+        """
+        advantages = advantages.detach().float().flatten()
+        with torch.no_grad():
+            valid_mask = torch.isfinite(advantages)
+
+            # Gather across processes so that the reported indices refer to the whole batch and are identical on
+            # every process. `gather_for_metrics` also removes accelerate's padding for uneven process batches.
+            gathered_advantages = self.accelerator.gather_for_metrics(advantages)
+            gathered_valid = self.accelerator.gather_for_metrics(valid_mask)
+
+            finite_advantages = gathered_advantages[gathered_valid]
+            if finite_advantages.numel() > 0:
+                min_advantage = finite_advantages.min().item()
+                max_advantage = finite_advantages.max().item()
+            else:
+                min_advantage = None
+                max_advantage = None
+
+            invalid_indices = torch.nonzero(~gathered_valid, as_tuple=False).flatten().tolist()
+
+        diagnostics = {
+            "min_advantage": min_advantage,
+            "max_advantage": max_advantage,
+            "num_invalid": len(invalid_indices),
+            "invalid_indices": invalid_indices,
+        }
+        self._last_batch_diagnostics = diagnostics
+
+        if invalid_indices:
+            logger.warning(
+                "Detected %d sample(s) with non-finite advantages in the batch at indices %s. "
+                "Finite advantage range: [%s, %s]. This batch will be rejected before reaching the optimizer.",
+                len(invalid_indices),
+                invalid_indices,
+                min_advantage,
+                max_advantage,
+            )
+        else:
+            logger.debug(
+                "Batch advantage diagnostics: range [%s, %s], %d valid sample(s).",
+                min_advantage,
+                max_advantage,
+                int(gathered_valid.sum().item()),
+            )
+        return diagnostics
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         mode = "train" if self.model.training else "eval"
 
@@ -763,6 +831,26 @@ class RewardTrainer(_BaseTrainer):
 
         # Split the rewards into chosen and rejected
         rewards_chosen, rewards_rejected = torch.chunk(outputs.logits.squeeze(-1), chunks=2)
+
+        # Per-sample advantages of the Bradley-Terry preference loss: each sample contributes a log-sigmoid term
+        # evaluated at `reward_chosen - reward_rejected - margin`.
+        advantages = rewards_chosen - rewards_rejected
+        if "margin" in inputs:
+            advantages = advantages - inputs["margin"]
+
+        # Generate a read-only diagnostic (advantage range + invalid sample indices) before any optimization step.
+        # The diagnostic cannot alter sampling: it is deterministic, RNG-free and never feeds back into the loss.
+        if mode == "train":
+            diagnostics = self._diagnose_advantages(advantages)
+
+            # Reject the batch before backward/optimizer.step() so that non-finite values can never reach the
+            # optimizer (which would silently poison the model weights).
+            if diagnostics["num_invalid"] > 0:
+                raise ValueError(
+                    f"Refusing to update the reward model: {diagnostics['num_invalid']} sample(s) in the batch have "
+                    f"non-finite advantages at global indices {diagnostics['invalid_indices']} "
+                    f"(finite advantage range: [{diagnostics['min_advantage']}, {diagnostics['max_advantage']}])."
+                )
 
         # Calculate loss, optionally modulate with margin
         if "margin" in inputs:
