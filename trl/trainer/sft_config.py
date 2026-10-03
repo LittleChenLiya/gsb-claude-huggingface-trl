@@ -90,6 +90,18 @@ class SFTConfig(_BaseConfig):
             If set, the sequences will be padded to a multiple of this value.
         eval_packing (`bool`, *optional*):
             Whether to pack the eval dataset. If `None`, uses the same value as `packing`.
+        filter_bad_examples (`bool`, *optional*, defaults to `False`):
+            Whether to filter out invalid examples during dataset preprocessing and collect statistics. When
+            enabled, examples falling into one of the following categories are dropped instead of raising an
+            error, and per-reason counts are collected:
+
+            - **empty**: the text (or the last message / prompt-completion) is `None` or empty/whitespace-only.
+            - **too_long**: the tokenized sequence is longer than `max_length` (instead of being truncated).
+            - **template_error**: the chat template (or tokenizer) raises while tokenizing the example.
+
+            The collected statistics contain counts only — no training text is recorded — and are exposed as
+            `trainer.filter_stats`. When disabled (the default), examples are truncated to `max_length` and
+            template failures raise as usual, preserving the original sample order and behavior.
 
         > Parameters that control the training
 
@@ -253,6 +265,15 @@ class SFTConfig(_BaseConfig):
     eval_packing: bool | None = field(
         default=None,
         metadata={"help": "Whether to pack the eval dataset. If `None`, uses the same value as `packing`."},
+    )
+    filter_bad_examples: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to filter out invalid examples (empty text, too long, or chat-template failures) "
+            "during dataset preprocessing and collect per-reason statistics. When disabled (the default), "
+            "examples are truncated to `max_length` and template failures raise as usual, preserving the "
+            "original sample order and behavior."
+        },
     )
 
     # Parameters that control the training

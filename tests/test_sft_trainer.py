@@ -40,6 +40,7 @@ from trl import SFTConfig, SFTTrainer
 from trl.trainer.sft_trainer import (
     DataCollatorForLanguageModeling,
     _chunked_cross_entropy_loss,
+    _is_empty_example,
     _patch_chunked_ce_lm_head,
     dft_loss,
 )
@@ -2411,6 +2412,118 @@ class TestSFTTrainer(TrlTestCase):
         assert trainer.model.config.eos_token_id == eos_token_id
         # The model's own eos tokens are kept, since any of them halts generation
         assert trainer.model.generation_config.eos_token_id == expected_eos_token_ids
+
+
+class TestSFTFilterBadExamples(TrlTestCase):
+    """
+    Tests for `filter_bad_examples`: preprocessing drops empty, too-long, and chat-template-failed examples with
+    per-reason statistics, while leaving the dataset untouched (same order and behavior) when disabled.
+    """
+
+    # A chat template that renders user/assistant turns normally but raises a `TypeError` for the "tool" role, so
+    # the template-failure path is exercised without a network download.
+    _CHAT_TEMPLATE = (
+        "{% for message in messages %}"
+        "{% if message.role == 'tool' %}{{ message.content + 1 }}"
+        "{% else %}{{ message.role }}: {{ message.content }}\n{% endif %}"
+        "{% endfor %}"
+    )
+
+    def _make_trainer(self, dataset, filter_bad_examples, max_length=1024):
+        model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", dtype="float32")
+        tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
+        tokenizer.chat_template = self._CHAT_TEMPLATE
+        args = SFTConfig(
+            output_dir=self.tmp_dir,
+            report_to="none",
+            filter_bad_examples=filter_bad_examples,
+            max_length=max_length,
+            loss_type="nll",
+        )
+        return SFTTrainer(model=model, args=args, train_dataset=dataset, processing_class=tokenizer)
+
+    @staticmethod
+    def _fixture_dataset():
+        # Five samples: empty text, too long, template error, and two valid conversations.
+        return Dataset.from_dict(
+            {
+                "messages": [
+                    [{"role": "user", "content": ""}],  # empty
+                    [{"role": "user", "content": "hello " * 2000}],  # too long
+                    [{"role": "tool", "content": "data"}],  # template error
+                    [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],  # valid
+                    [{"role": "user", "content": "bye"}, {"role": "assistant", "content": "goodbye"}],  # valid
+                ]
+            }
+        )
+
+    def test_filter_bad_examples_statistics_and_order(self):
+        dataset = self._fixture_dataset()
+        trainer = self._make_trainer(dataset, filter_bad_examples=True)
+
+        stats = trainer.filter_stats
+        assert stats == {"total": 5, "kept": 2, "empty": 1, "too_long": 1, "template_error": 1}
+        # Statistics contain counts only — no training text is recorded.
+        assert all(isinstance(value, int) for value in stats.values())
+
+        # The two valid samples are kept, in their original order.
+        assert trainer.train_dataset.num_rows == 2
+        tokenizer = trainer.processing_class
+        expected = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],
+                tokenize=True,
+                return_dict=True,
+            )["input_ids"],
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": "bye"}, {"role": "assistant", "content": "goodbye"}],
+                tokenize=True,
+                return_dict=True,
+            )["input_ids"],
+        ]
+        assert trainer.train_dataset["input_ids"] == expected
+
+    def test_filter_bad_examples_disabled_raises_on_template_error(self):
+        dataset = self._fixture_dataset()
+        # Without filtering, a template failure propagates (the original failure-path behavior).
+        with pytest.raises(TypeError, match="can only concatenate str"):
+            self._make_trainer(dataset, filter_bad_examples=False)
+
+    def test_filter_bad_examples_disabled_order_unchanged(self):
+        dataset = Dataset.from_dict(
+            {
+                "messages": [
+                    [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}],
+                    [{"role": "user", "content": "c"}, {"role": "assistant", "content": "d"}],
+                    [{"role": "user", "content": "e"}, {"role": "assistant", "content": "f"}],
+                ]
+            }
+        )
+        trainer = self._make_trainer(dataset, filter_bad_examples=False)
+
+        assert trainer.filter_stats is None
+        assert trainer.train_dataset.num_rows == 3
+        tokenizer = trainer.processing_class
+        expected = [
+            tokenizer.apply_chat_template(messages, tokenize=True, return_dict=True)["input_ids"]
+            for messages in dataset["messages"]
+        ]
+        assert trainer.train_dataset["input_ids"] == expected
+
+    def test_is_empty_example(self):
+        # Language modeling text
+        assert _is_empty_example({"text": ""}, "text")
+        assert _is_empty_example({"text": "   "}, "text")
+        assert _is_empty_example({"text": None}, "text")
+        assert not _is_empty_example({"text": "hello"}, "text")
+        # Conversational messages
+        assert _is_empty_example({"messages": []}, "text")
+        assert _is_empty_example({"messages": [{"role": "user", "content": ""}]}, "text")
+        assert not _is_empty_example({"messages": [{"role": "user", "content": "hi"}]}, "text")
+        # Prompt-completion: empty only when both prompt and completion are empty
+        assert _is_empty_example({"prompt": "", "completion": ""}, "text")
+        assert not _is_empty_example({"prompt": "", "completion": "hello"}, "text")
+        assert not _is_empty_example({"prompt": "hello", "completion": ""}, "text")
 
 
 @pytest.mark.slow
