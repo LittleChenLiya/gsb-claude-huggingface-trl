@@ -75,6 +75,11 @@ class DPOConfig(_BaseConfig):
             Batch size to use when precomputing reference model log probabilities. This can be set higher than the
             training batch size to speed up preprocessing. If `None`, defaults to `per_device_train_batch_size` for
             training and `per_device_eval_batch_size` for evaluation.
+        precheck_preference_alignment (`bool`, *optional*, defaults to `True`):
+            Whether to run a preference alignment precheck before each optimizer step. The precheck verifies that the
+            chosen and rejected completions within each preference pair share the same prompt (i.e. they come from the
+            same prompt). If a mismatch is found, training fails with the misaligned pair indices before any optimizer
+            step is taken. Disable only if you have verified your data pipeline produces correctly aligned pairs.
 
         > Parameters that control the training
 
@@ -234,6 +239,16 @@ class DPOConfig(_BaseConfig):
             "help": "Batch size to use when precomputing reference model log probabilities. This can be set higher "
             "than the training batch size to speed up preprocessing. If `None`, defaults to "
             "`per_device_train_batch_size` for training and `per_device_eval_batch_size` for evaluation."
+        },
+    )
+    precheck_preference_alignment: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to run a preference alignment precheck before each optimizer step. The precheck verifies "
+            "that the chosen and rejected completions within each preference pair share the same prompt (i.e. they "
+            "come from the same prompt). If a mismatch is found, training fails with the misaligned pair indices "
+            "before any optimizer step is taken. Disable only if you have verified your data pipeline produces "
+            "correctly aligned pairs."
         },
     )
 

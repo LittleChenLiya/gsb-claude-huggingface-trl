@@ -1008,6 +1008,76 @@ class DPOTrainer(_BaseTrainer):
                         self.args.precompute_ref_batch_size or self.args.per_device_eval_batch_size,
                     )
 
+    def _precheck_preference_alignment(self, inputs: dict[str, torch.Tensor]) -> list[int]:
+        """
+        Precheck that the chosen and rejected completions in a training batch are paired with the same prompt.
+
+        The batch produced by the data collator is laid out as ``[chosen_half, rejected_half]``: the first ``B`` rows
+        are the chosen completions and the last ``B`` rows are the rejected completions, where ``B`` is the number of
+        preference pairs. For pair ``i``, the prompt prefix (the non-padding tokens before the first completion token)
+        of chosen row ``i`` must be identical to the prompt prefix of rejected row ``i``. If they differ, the chosen
+        and rejected completions come from different prompts (misaligned preference pairs), and training must not
+        proceed.
+
+        This is a defensive guard against data corruption (e.g. a buggy custom collator, shuffled preference columns,
+        or misaligned pre-tokenized data). It runs before the model forward, so a failure raises before any optimizer
+        step is taken.
+
+        Args:
+            inputs (`dict[str, torch.Tensor]`):
+                A batch of inputs produced by the data collator. Must contain ``"input_ids"``, ``"attention_mask"``,
+                and ``"completion_mask"``.
+
+        Returns:
+            `list[int]`: The list of misaligned pair indices. Empty if all pairs are aligned.
+
+        Raises:
+            ValueError: If the batch has an odd number of rows, or if one or more chosen/rejected pairs have mismatched
+                prompt prefixes.
+        """
+        input_ids = inputs["input_ids"]
+        completion_mask = inputs["completion_mask"]
+        attention_mask = inputs["attention_mask"]
+        num_rows = input_ids.size(0)
+        if num_rows % 2 != 0:
+            raise ValueError(
+                f"Preference alignment precheck expects an even number of rows (chosen half + rejected half), got "
+                f"{num_rows}. Please verify your data collator produces a [chosen, rejected] layout."
+            )
+        num_pairs = num_rows // 2
+
+        def _prompt_ids(row_ids: torch.Tensor, row_completion_mask: torch.Tensor, row_attention_mask: torch.Tensor):
+            # The first completion token marks the end of the prompt. The prompt is everything before it, excluding
+            # padding tokens. This is robust to both right-padding (prompt at the start) and left-padding (prompt at
+            # the end of the pre-completion region).
+            first_completion = row_completion_mask.argmax()
+            has_completion = row_completion_mask.any()
+            positions = torch.arange(row_ids.size(0), device=row_ids.device)
+            if has_completion:
+                prompt_mask = (positions < first_completion) & row_attention_mask.bool()
+            else:
+                prompt_mask = row_attention_mask.bool()
+            return row_ids[prompt_mask]
+
+        misaligned = []
+        for i in range(num_pairs):
+            chosen_prompt = _prompt_ids(input_ids[i], completion_mask[i], attention_mask[i])
+            rejected_prompt = _prompt_ids(
+                input_ids[num_pairs + i], completion_mask[num_pairs + i], attention_mask[num_pairs + i]
+            )
+            if chosen_prompt.shape != rejected_prompt.shape or not torch.equal(chosen_prompt, rejected_prompt):
+                misaligned.append(i)
+
+        if misaligned:
+            raise ValueError(
+                f"Preference alignment precheck failed: {len(misaligned)} pair(s) have chosen and rejected completions "
+                f"with mismatched prompts. Misaligned pair indices: {misaligned}. Each chosen/rejected pair must "
+                f"share the same prompt. Please verify your data pipeline (collator, tokenization, and any shuffling "
+                f"of preference columns). To disable this check, set `precheck_preference_alignment=False` in "
+                f"`DPOConfig`."
+            )
+        return misaligned
+
     def _prepare_dataset(
         self,
         dataset: Dataset | IterableDataset,
@@ -1328,6 +1398,10 @@ class DPOTrainer(_BaseTrainer):
                 "return_outputs=True is not supported with the chunked DPO path because it does not materialize "
                 "logits."
             )
+        # Precheck that chosen/rejected pairs share the same prompt before any forward/backward. A failure raises
+        # here, so the optimizer step is never reached.
+        if self.args.precheck_preference_alignment:
+            self._precheck_preference_alignment(inputs)
         mode = "train" if self.model.training else "eval"
         device = self.accelerator.device
 

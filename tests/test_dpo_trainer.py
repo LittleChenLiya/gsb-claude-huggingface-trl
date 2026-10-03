@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+
 import pytest
 import torch
 import transformers
 from datasets import Dataset, DatasetDict, IterableDatasetDict, load_dataset
 from packaging.version import Version
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedTokenizerFast
 from transformers.testing_utils import torch_device
 from transformers.utils import is_peft_available
 
@@ -1962,6 +1964,214 @@ class TestDPOTrainerVLM(TrlTestCase):
         assert trainer.processing_class.tokenizer.pad_token_id == pad_token_id
         assert trainer.model.config.get_text_config().pad_token_id == pad_token_id
         assert trainer.model.generation_config.pad_token_id == pad_token_id
+
+
+class TestPreferenceAlignmentPrecheck(TrlTestCase):
+    """Tests for the DPO preference alignment precheck (`precheck_preference_alignment`).
+
+    The precheck verifies that the chosen and rejected completions within each preference pair share the same prompt.
+    A failure raises before any optimizer step is taken. These tests use a tiny model built from config (no network
+    access required) and a synthetic preference dataset.
+    """
+
+    @staticmethod
+    def _make_tiny_model_and_tokenizer():
+        """Build a tiny Qwen2 model from config and a word-level tokenizer (no network access)."""
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+
+        vocab = {
+            "<unk>": 0,
+            "<pad>": 1,
+            "<eos>": 2,
+            "hello": 3,
+            "world": 4,
+            "foo": 5,
+            "bar": 6,
+            "baz": 7,
+            "qux": 8,
+            "prompt": 9,
+            "response": 10,
+            "a": 11,
+            "b": 12,
+        }
+        tok = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
+        tok.pre_tokenizer = Whitespace()
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=tok, pad_token="<pad>", eos_token="<eos>")
+
+        config = Qwen2Config(
+            vocab_size=len(vocab),
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            pad_token_id=1,
+        )
+        model = Qwen2ForCausalLM(config)
+        return model, tokenizer
+
+    @staticmethod
+    def _make_preference_dataset():
+        """Create a synthetic preference dataset with two pairs."""
+        return Dataset.from_list(
+            [
+                {"prompt": "prompt a", "chosen": "hello world <eos>", "rejected": "foo bar <eos>"},
+                {"prompt": "prompt b", "chosen": "baz qux <eos>", "rejected": "hello foo <eos>"},
+            ]
+        )
+
+    @staticmethod
+    def _make_trainer(model, tokenizer, dataset, **kwargs):
+        """Create a DPOTrainer with CPU-friendly defaults."""
+        data_collator = kwargs.pop("data_collator", None)
+        defaults = dict(
+            output_dir="/tmp/dpo_precheck_test",
+            per_device_train_batch_size=2,
+            max_steps=1,
+            report_to="none",
+            use_cpu=True,
+            bf16=False,
+            precheck_preference_alignment=True,
+        )
+        defaults.update(kwargs)
+        return DPOTrainer(
+            model=model,
+            ref_model=copy.deepcopy(model),
+            args=DPOConfig(**defaults),
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            data_collator=data_collator,
+        )
+
+    def test_precheck_passes_for_aligned_pairs(self):
+        """Correctly aligned chosen/rejected pairs pass the precheck and return no misaligned indices."""
+        model, tokenizer = self._make_tiny_model_and_tokenizer()
+        dataset = self._make_preference_dataset()
+        trainer = self._make_trainer(model, tokenizer, dataset)
+
+        batch = next(iter(trainer.get_train_dataloader()))
+        misaligned = trainer._precheck_preference_alignment(batch)
+
+        assert misaligned == []
+
+    def test_precheck_raises_for_misaligned_pairs(self):
+        """Misaligned chosen/rejected pairs raise ValueError with the correct misaligned indices."""
+        model, tokenizer = self._make_tiny_model_and_tokenizer()
+        dataset = self._make_preference_dataset()
+        trainer = self._make_trainer(model, tokenizer, dataset)
+
+        batch = next(iter(trainer.get_train_dataloader()))
+        # Deliberately misalign pair 0: change the prompt token of rejected row 0 to differ from chosen row 0.
+        misaligned_batch = {k: v.clone() for k, v in batch.items()}
+        num_pairs = misaligned_batch["input_ids"].size(0) // 2
+        misaligned_batch["input_ids"][num_pairs, 0] = 12  # token "b", different from the original prompt token
+
+        with pytest.raises(ValueError, match=r"[Mm]isaligned pair indices: \[0\]"):
+            trainer._precheck_preference_alignment(misaligned_batch)
+
+    def test_precheck_reports_multiple_misaligned_indices(self):
+        """The precheck reports all misaligned indices, not just the first one."""
+        model, tokenizer = self._make_tiny_model_and_tokenizer()
+        dataset = self._make_preference_dataset()
+        trainer = self._make_trainer(model, tokenizer, dataset)
+
+        batch = next(iter(trainer.get_train_dataloader()))
+        misaligned_batch = {k: v.clone() for k, v in batch.items()}
+        num_pairs = misaligned_batch["input_ids"].size(0) // 2
+        # Misalign both pairs
+        misaligned_batch["input_ids"][num_pairs, 0] = 12
+        misaligned_batch["input_ids"][num_pairs + 1, 0] = 11  # token "a"
+
+        with pytest.raises(ValueError, match=r"[Mm]isaligned pair indices: \[0, 1\]"):
+            trainer._precheck_preference_alignment(misaligned_batch)
+
+    def test_precheck_disabled_does_not_raise(self):
+        """When precheck_preference_alignment=False, misaligned data does not raise."""
+        model, tokenizer = self._make_tiny_model_and_tokenizer()
+        dataset = self._make_preference_dataset()
+        trainer = self._make_trainer(model, tokenizer, dataset, precheck_preference_alignment=False)
+
+        batch = next(iter(trainer.get_train_dataloader()))
+        misaligned_batch = {k: v.clone() for k, v in batch.items()}
+        num_pairs = misaligned_batch["input_ids"].size(0) // 2
+        misaligned_batch["input_ids"][num_pairs, 0] = 12
+
+        # Should not raise
+        loss = trainer.compute_loss(trainer.model, misaligned_batch)
+        assert loss is not None
+
+    def test_precheck_is_read_only_loss_unchanged(self):
+        """The precheck does not modify inputs or the model, so the loss is identical with and without it."""
+        model, tokenizer = self._make_tiny_model_and_tokenizer()
+        dataset = self._make_preference_dataset()
+        trainer = self._make_trainer(model, tokenizer, dataset)
+
+        batch = next(iter(trainer.get_train_dataloader()))
+
+        trainer.args.precheck_preference_alignment = True
+        loss_with = trainer.compute_loss(trainer.model, batch)
+        trainer.args.precheck_preference_alignment = False
+        loss_without = trainer.compute_loss(trainer.model, batch)
+
+        torch.testing.assert_close(loss_with, loss_without)
+
+    def test_precheck_raises_on_odd_number_of_rows(self):
+        """An odd number of rows (not [chosen, rejected]) raises ValueError."""
+        model, tokenizer = self._make_tiny_model_and_tokenizer()
+        dataset = self._make_preference_dataset()
+        trainer = self._make_trainer(model, tokenizer, dataset)
+
+        batch = next(iter(trainer.get_train_dataloader()))
+        # Drop one row to make the count odd
+        odd_batch = {k: v[:-1] for k, v in batch.items()}
+
+        with pytest.raises(ValueError, match="even number of rows"):
+            trainer._precheck_preference_alignment(odd_batch)
+
+    def test_end_to_end_training_with_aligned_pairs(self):
+        """End-to-end training with correctly aligned pairs completes and updates weights."""
+        model, tokenizer = self._make_tiny_model_and_tokenizer()
+        dataset = self._make_preference_dataset()
+        trainer = self._make_trainer(model, tokenizer, dataset, max_steps=2, learning_rate=0.1)
+
+        prev_params = {n: p.clone() for n, p in model.named_parameters()}
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+        changed = sum(1 for n, p in model.named_parameters() if not torch.equal(prev_params[n], p))
+        assert changed > 0, "Model weights should have changed after training"
+
+    def test_end_to_end_training_with_misaligned_pairs_raises_before_optimizer_step(self):
+        """End-to-end training with misaligned pairs raises before any optimizer step (weights unchanged)."""
+        model, tokenizer = self._make_tiny_model_and_tokenizer()
+        dataset = self._make_preference_dataset()
+
+        # Custom collator that deliberately misaligns chosen/rejected prompts
+        base_collator = DataCollatorForPreference(pad_token_id=1)
+
+        class MisalignedCollator:
+            def __call__(self, examples):
+                batch = base_collator(examples)
+                num_pairs = batch["input_ids"].size(0) // 2
+                # Misalign pair 0: change the prompt token of rejected row 0
+                batch["input_ids"][num_pairs, 0] = 12  # token "b"
+                return batch
+
+        trainer = self._make_trainer(
+            model, tokenizer, dataset, data_collator=MisalignedCollator(), max_steps=1, learning_rate=0.1
+        )
+
+        prev_params = {n: p.clone() for n, p in model.named_parameters()}
+        with pytest.raises(ValueError, match=r"[Mm]isaligned pair indices: \[0\]"):
+            trainer.train()
+
+        # Verify no optimizer step was taken: weights must be unchanged
+        for n, p in model.named_parameters():
+            assert torch.equal(prev_params[n], p), f"Parameter {n} changed despite precheck failure"
 
 
 @pytest.mark.slow
