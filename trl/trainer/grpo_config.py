@@ -769,6 +769,18 @@ class GRPOConfig(_BaseConfig):
             "rewards are weighted equally with weight `1.0`."
         },
     )
+    missing_reward_strategy: str = field(
+        default="skip",
+        metadata={
+            "help": "Strategy to handle missing rewards, i.e. when a reward function returns `None` for a sample. "
+            "Supported values are: "
+            "`'skip'` (default): missing rewards are skipped during reward aggregation (NaN-aware summation). A "
+            "completion for which every reward function returns `None` gets no learning signal (its advantage is "
+            "forced to `0`), so all-missing groups produce no gradient. "
+            "`'fail'`: raise a `ValueError` as soon as any reward function returns `None` for any sample. Useful to "
+            "catch silent reward misconfiguration."
+        },
+    )
     multi_objective_aggregation: str = field(
         default="sum_then_normalize",
         metadata={
@@ -1063,6 +1075,11 @@ class GRPOConfig(_BaseConfig):
             )
 
         self.scale_rewards = {True: "group", False: "none"}.get(self.scale_rewards, self.scale_rewards)
+
+        if self.missing_reward_strategy not in ("skip", "fail"):
+            raise ValueError(
+                f"Invalid missing_reward_strategy: {self.missing_reward_strategy!r}. Must be 'skip' or 'fail'."
+            )
 
         if self.log_completions_hub_repo is not None and not self.log_completions:
             raise ValueError(

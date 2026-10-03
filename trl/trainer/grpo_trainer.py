@@ -1619,6 +1619,19 @@ class GRPOTrainer(_BaseTrainer):
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
         rewards_per_func = gather(rewards_per_func)
+
+        # With the "fail" strategy, any missing reward (a reward function returning `None` for a sample) is a hard
+        # error rather than something to silently skip over during aggregation. The check runs after the gather so
+        # that all processes reach the same collective before raising.
+        if self.args.missing_reward_strategy == "fail" and torch.isnan(rewards_per_func).any():
+            nan_rows, nan_cols = torch.isnan(rewards_per_func).nonzero(as_tuple=True)
+            func_names = sorted({self.reward_func_names[c] for c in nan_cols.tolist()})
+            raise ValueError(
+                f"Missing rewards detected with missing_reward_strategy='fail': {nan_rows.numel()} reward value(s) "
+                f"are `None` across {len(func_names)} reward function(s) ({', '.join(func_names)}). Set "
+                "missing_reward_strategy='skip' to skip missing rewards during aggregation instead."
+            )
+
         return rewards_per_func
 
     def _tokenize_prompts(self, prompts: list):

@@ -14,6 +14,7 @@
 
 import gc
 import os
+import contextlib
 import warnings
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -86,6 +87,44 @@ async def async_multiply_tool(a: int, b: int) -> int:
         The product of the two integers.
     """
     return a * b
+
+
+class _FallbackChunkedLogProb:
+    """Pure-PyTorch stand-in for the Triton `ChunkedLogProbFunction`.
+
+    TRL's fused LM head scores completions through a Triton kernel that is unavailable on some platforms (e.g.
+    Windows). Tests that only need the trainer's reward/advantage logic use this fallback so the fused head runs on
+    CPU without Triton.
+    """
+
+    @staticmethod
+    def apply(hidden, weight, bias, targets, temperature, chunk_size, final_logit_softcapping=None, logit_scale=1.0):
+        logits = torch.mm(hidden, weight.t())
+        if bias is not None:
+            logits = logits + bias
+        logits = logits * logit_scale
+        if final_logit_softcapping is not None:
+            logits = final_logit_softcapping * torch.tanh(logits / final_logit_softcapping)
+        logits = logits / temperature
+        logprobs_all = torch.log_softmax(logits, dim=-1)
+        logprobs = logprobs_all.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        p = logprobs_all.exp()
+        log_z = torch.logsumexp(logits, dim=-1)
+        entropy = log_z - (logits * p).sum(-1)
+        return logprobs, entropy
+
+
+@contextlib.contextmanager
+def _patch_fused_lm_head_for_cpu():
+    """Patch the fused-LM-head kernel with a pure-PyTorch fallback for the duration of the test."""
+    import trl.trainer.utils as trl_utils
+
+    original = trl_utils._ChunkedLogProbFunction
+    trl_utils._ChunkedLogProbFunction = _FallbackChunkedLogProb
+    try:
+        yield
+    finally:
+        trl_utils._ChunkedLogProbFunction = original
 
 
 class TestGetHighEntropyMask(TrlTestCase):
@@ -1408,6 +1447,119 @@ class TestGRPOTrainer(TrlTestCase):
         for n, param in previous_trainable_params.items():
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+    def test_missing_reward_strategy_skip(self):
+        """Default 'skip' strategy: partial + all-missing rewards are handled, no NaN gradients.
+
+        A fake reward function returns `None` for some completions (partial missing) and `None` for every completion
+        of one prompt group (all-missing group). The trainer must skip the missing rewards during aggregation, force
+        the all-missing group's advantage to 0, and complete training without producing NaN gradients.
+        """
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        all_missing_prompt = "Complex"  # unique prompt whose whole group gets None
+        records = []
+
+        def fake_reward_func(completions, prompts, **kwargs):
+            out = []
+            for comp, prompt in zip(completions, prompts):
+                if all_missing_prompt in prompt:
+                    out.append(None)  # all-missing group
+                elif "e" in comp:
+                    out.append(None)  # partial missing
+                else:
+                    out.append(float(len(set(comp))))  # varies within group
+            records.append((list(prompts), list(out)))
+            return out
+
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            per_device_train_batch_size=4,  # reduce the batch size to reduce memory usage
+            num_generations=4,  # reduce the number of generations to reduce memory usage
+            max_completion_length=8,  # reduce the completion length to reduce memory usage
+            report_to="none",
+            missing_reward_strategy="skip",  # default: skip missing rewards during aggregation
+        )
+
+        with _patch_fused_lm_head_for_cpu():
+            trainer = GRPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                reward_funcs=fake_reward_func,
+                args=training_args,
+                train_dataset=dataset,
+            )
+
+            previous_trainable_params = {
+                n: param.clone() for n, param in trainer.model.named_parameters() if param.requires_grad
+            }
+
+            trainer.train()
+
+        assert trainer.state.global_step > 0, "Training did not run any steps"
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
+        # All-missing groups must not produce NaN gradients: every parameter stays finite.
+        for n, param in trainer.model.named_parameters():
+            assert torch.isfinite(param).all(), f"Parameter {n} is not finite (NaN gradient?)"
+
+        # Gradients flowed: params have changed.
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+        # Verify the valid count per group: the all-missing prompt group has 0 valid rewards, all others a valid
+        # count between 0 and num_generations.
+        all_missing_groups = 0
+        for prompts, rewards in records:
+            groups = {}
+            for p, r in zip(prompts, rewards):
+                groups.setdefault(p, []).append(r)
+            for p, rs in groups.items():
+                valid = sum(1 for r in rs if r is not None)
+                if all_missing_prompt in p:
+                    assert valid == 0, f"All-missing group {p!r} has {valid} valid rewards (expected 0)"
+                    all_missing_groups += 1
+                else:
+                    assert 0 <= valid <= len(rs), f"Group {p!r} has {valid} valid rewards out of {len(rs)}"
+        assert all_missing_groups > 0, "No all-missing group was exercised by the fake reward function"
+
+    def test_missing_reward_strategy_fail(self):
+        """'fail' strategy: raises ValueError as soon as any reward function returns None."""
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        def fake_reward_func(completions, **kwargs):
+            rewards = [float(len(set(c))) for c in completions]
+            rewards[0] = None  # at least one missing reward
+            return rewards
+
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=4,
+            num_generations=4,
+            max_completion_length=8,
+            report_to="none",
+            missing_reward_strategy="fail",
+        )
+
+        with _patch_fused_lm_head_for_cpu():
+            trainer = GRPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                reward_funcs=fake_reward_func,
+                args=training_args,
+                train_dataset=dataset,
+            )
+            with pytest.raises(ValueError, match="Missing rewards detected"):
+                trainer.train()
+
+    def test_missing_reward_strategy_invalid(self):
+        """Invalid missing_reward_strategy raises at configuration time."""
+        with pytest.raises(ValueError, match="Invalid missing_reward_strategy"):
+            GRPOConfig(
+                output_dir=self.tmp_dir,
+                report_to="none",
+                missing_reward_strategy="bogus",
+            )
 
     def test_train_multiple_reward_funcs_with_weights(self):
         """Test that GRPOTrainer can handle multiple reward functions with weights."""
